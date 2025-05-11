@@ -6,10 +6,16 @@
 #  ░ ▒░   ░  ░░▓  ░ ▒▓ ░▒▓░ ▒▒   ▓▒█░░▓  
 #  ░  ░      ░ ▒ ░  ░▒ ░ ▒░  ▒   ▒▒ ░ ▒ ░
 #  ░      ░    ▒ ░  ░░   ░   ░   ▒    ▒ ░
-#         ░    ░     ░           ░  ░ ░  
+#         ░    ░     ░           ░  ░ ░   Build config
 
-IMAGE_SIZE=128M
-CACHE_IMAGE_PATH=./builds-cache/boot.img
+#
+# IMAGE
+#
+IMAGE_SIZE=256M
+IMAGE_FILENAME=mirai_$(date +%Y%m%d_%H%M%S).img
+LOCAL_IMAGE_MOUNTPOINT=/mnt/mirai
 
-LOCAL_IMAGE_MOUNTPOINT=/mnt
-EFI_PATH=${LOCAL_IMAGE_MOUNTPOINT}/boot/efi
+#
+# BOOTLOADER
+#
+EFI_PATH=${LOCAL_IMAGE_MOUNTPOINT}/boot/EFI

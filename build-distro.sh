@@ -16,7 +16,12 @@ cat <<'EOF'
 EOF
 
 source ./config.sh
-mkdir -p builds builds-cache builds-cache/initramfs builds-cache/initramfs/proc builds-cache/initramfs/sys
+rm -rf builds-cache/*
+mkdir -p ${LOCAL_IMAGE_MOUNTPOINT}
+mkdir -p builds builds-cache builds-cache/initramfs
+mkdir -p builds-cache/initramfs/{proc,sys,tmp,lib,dev,etc/network,usr/share/udhcpc}
+
+CACHE_IMAGE_PATH=./builds-cache/boot.img
 
 if mountpoint -q "${LOCAL_IMAGE_MOUNTPOINT}"; then
     echo "Unmounting ${LOCAL_IMAGE_MOUNTPOINT}"
@@ -29,13 +34,13 @@ truncate -s $IMAGE_SIZE "$CACHE_IMAGE_PATH" # Create blank disk image
 LOOPDEV=$(losetup --show --find "$CACHE_IMAGE_PATH") # Set up loop device with partitions
 
 # Partition the image
-echo -e "o\ny\nn\n1\n\n+64M\nef00\nn\n2\n\n\n8300\nw\ny" | gdisk "$LOOPDEV"
+echo -e "o\ny\nn\n1\n\n+128M\nef00\nn\n2\n\n\n8300\nw\ny" | gdisk "$LOOPDEV"
 #o  # Create a new GPT partition table
 #y  # Confirm the deletion of existing partitions (if any)
 #n  # Create a new partition
 #1  # Partition number (1 for EFI)
   # First sector (default)
-#+64M  # Partition size (64MB for EFI)
+#+128M  # Partition size (128MB for EFI)
 #ef00  # Partition type (EFI System)
 #n  # Create another partition
 #2  # Partition number (2 for root)
@@ -61,42 +66,91 @@ mkdir -p "$EFI_PATH"
 # Mount the EFI System Partition
 mount "${LOOPDEV}p1" "$EFI_PATH"
 
-# Clone Linux repo if it doesn't already exist
+# Clone required repos
 if [ ! -d linux ]; then
     git clone --depth 1 https://github.com/torvalds/linux.git
 fi
 
-# Clone Busybox repo if it doesn't already exist
 if [ ! -d busybox ]; then
     git clone --depth 1 https://git.busybox.net/busybox.git
 fi
 
-cp "./linux-config/.config" "./linux/.config"
-cp "./busybox-config/.config" "./busybox/.config"
+if [ ! -d glibc ]; then
+    git clone --depth 1 https://github.com/bminor/glibc.git
+fi
+
+cp -a "./linux-config/.config" "./linux/.config"
+cp -a "./busybox-config/.config" "./busybox/.config"
 
 # Build the kernel
 cd linux
-make -j"$(nproc)"
+    make -j"$(nproc)"
 cd ..
 
 # Copy built kernel image
 BZIMAGE_SOURCE="linux/arch/x86/boot/bzImage"
 BZIMAGE_TARGET="builds-cache/bzImage"
 if [ -f "$BZIMAGE_SOURCE" ]; then
-    cp "$BZIMAGE_SOURCE" "$BZIMAGE_TARGET"
+    cp -a "$BZIMAGE_SOURCE" "$BZIMAGE_TARGET"
 else
     echo "Kernel image not found: $BZIMAGE_SOURCE"
     exit 1
 fi
 
+# Build glibc (required by almost all linux programs)
+cd glibc
+    mkdir -p build
+        cd build
+        ../configure \
+            --prefix=/usr \
+            --disable-multilib \
+            --enable-static \
+            --disable-nls \
+            CC="gcc" CFLAGS="-Os -s" # "gcc -m32" if building for 32bit
+        make -j$(nproc)
+        make DESTDIR=$(pwd)/install install
+        echo "Stripping glibc symbols..."
+        find ./install -type f -name "*.so*" -exec file {} \; | grep ELF | cut -d: -f1 | xargs strip --strip-unneeded
+        find ./install -type f -executable -exec file {} \; | grep ELF | cut -d: -f1 | xargs strip --strip-all
+        echo "Pruning glibc locales, timezones, and NSS modules..."
+        rm -rf ./install/usr/share/locale/*
+        rm -rf ./install/usr/lib/gconv/*
+        rm -rf ./install/usr/lib/*nss*
+    cd ../..
+cp -a glibc/build/install/* "./builds-cache/initramfs/"
+
 # Build busybox into the initramfs
 cd busybox
-make -j"$(nproc)"
-make CONFIG_PREFIX=../builds-cache/initramfs install
+    make -j"$(nproc)"
+    make CONFIG_PREFIX=../builds-cache/initramfs install
 cd ..
 
+# Create necessary device nodes
+cd builds-cache/initramfs
+    sudo mknod -m 622 dev/console c 5 1
+    sudo mknod -m 666 dev/null c 1 3
+    sudo mknod -m 666 dev/zero c 1 5
+    sudo mknod -m 666 dev/tty c 5 0
+    sudo mknod -m 666 dev/tty0 c 4 0
+    sudo mknod -m 666 dev/random c 1 8
+    sudo mknod -m 666 dev/urandom c 1 9
+    sudo mknod -m 600 dev/eth0 c 10 1
+
+    ln -s /lib64/ld-linux-x86-64.so.2 lib/ld-linux-x86-64.so.2
+    ln -s /lib64/libm.so.6 lib/libm.so.6
+    ln -s /lib64/libresolv.so.2 lib/libresolv.so.2
+    ln -s /lib64/libc.so.6 lib/libc.so.6
+cd ../..
+
+# Set cloudflare as default DNS server
+cat > builds-cache/initramfs/etc/resolv.conf << EOF
+nameserver 1.1.1.1
+nameserver 1.0.0.1
+EOF
+chmod +x builds-cache/initramfs/etc/resolv.conf
+
 # Copy init script into initramfs
-cp "./initscript/init" "./builds-cache/initramfs/init"
+cp -a "./initscript/init" "./builds-cache/initramfs/init"
 chmod +x ./builds-cache/initramfs/init
 
 # Not needed
@@ -115,21 +169,25 @@ grub-install \
   --recheck
 
 mkdir -p $LOCAL_IMAGE_MOUNTPOINT/boot/grub/x86_64-efi/
-cp -r /usr/lib/grub/x86_64-efi/*.mod "$LOCAL_IMAGE_MOUNTPOINT/boot/grub/x86_64-efi/"
+cp -a -r /usr/lib/grub/x86_64-efi/*.mod "$LOCAL_IMAGE_MOUNTPOINT/boot/grub/x86_64-efi/"
 
+ESP_UUID=$(blkid -s UUID -o value "${LOOPDEV}p1")
+echo "ESP partition UUID is $ESP_UUID"
+export ESP_UUID
 ROOT_UUID=$(blkid -s UUID -o value "${LOOPDEV}p2")
 echo "Root partition UUID is $ROOT_UUID"
+export ROOT_UUID
 
-# Copy the GRUB config
+# Generate the GRUB config
 mkdir -p "$LOCAL_IMAGE_MOUNTPOINT/boot/grub"
-cp "./grub-config/live.cfg" "$LOCAL_IMAGE_MOUNTPOINT/boot/grub/grub.cfg"
+envsubst '$ROOT_UUID' < ./grub-config/live.cfg > "$LOCAL_IMAGE_MOUNTPOINT/boot/grub/grub.cfg"
 
-cp ./builds-cache/bzImage ${LOCAL_IMAGE_MOUNTPOINT}/boot/vmlinuz
-cp ./builds-cache/init.cpio ${LOCAL_IMAGE_MOUNTPOINT}/boot/initrd.img
+cp -a ./builds-cache/bzImage $LOCAL_IMAGE_MOUNTPOINT/boot/vmlinuz
+cp -a ./builds-cache/init.cpio $LOCAL_IMAGE_MOUNTPOINT/boot/initrd.img
 
-umount -R "${LOCAL_IMAGE_MOUNTPOINT}"
+umount -R "$LOCAL_IMAGE_MOUNTPOINT"
 losetup -d "$LOOPDEV"
 
-echo "Copying and renaming into ./builds"
-cp "./builds-cache/boot.img" "./builds/mirai_$(date +%Y%m%d_%H%M%S).img"
+echo "Copying built image to ./builds/$IMAGE_FILENAME"
+cp -a "./builds-cache/boot.img" "./builds/$IMAGE_FILENAME"
 echo "Done"

@@ -2,3 +2,4 @@ builds/
 builds-cache/
 busybox/
 linux/
+glibc/
